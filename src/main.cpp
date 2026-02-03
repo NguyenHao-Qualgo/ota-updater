@@ -19,11 +19,10 @@ constexpr const char *kDefaultConfigPath = "/etc/skytrack/skytrack.conf";
 void PrintUsage(const char *argv) {
     std::fprintf(stderr,
         "Usage:\n"
-        "   %s -i <input|-> [-o </dev/partition>] [-f <bytes>] [--progress]\n"
+        "   %s [-i input] [-f <bytes>] [--progress]\n"
         "\n"
         "Options:\n"
         "  -i, --input            Input file path or '-' for stdin\n"
-        "  -o, --output           Output partition path (e.g. /dev/nvme0n1p1)\n"
         "  -f, --fsync-interval   Bytes between fsync() calls (default 1048576). 0 disables fsync\n"
         "  -h, --help             Show this help\n",
         argv);
@@ -35,7 +34,6 @@ int main(int argc, char **argv) {
     flash::InstallSignalHandlers();
 
     const char *in = nullptr;
-    const char *out_cli = nullptr;
     std::string config_path = kDefaultConfigPath;
 
     flash::FlashOptions opt{};
@@ -44,7 +42,6 @@ int main(int argc, char **argv) {
 
     static option long_opts[] = {
         {"input", required_argument, nullptr, 'i'},
-        {"output", required_argument, nullptr, 'o'},
         {"fsync-interval", required_argument, nullptr, 'f'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
@@ -60,10 +57,6 @@ int main(int argc, char **argv) {
 
             case 'i':
                 in = optarg;
-                break;
-
-            case 'o':
-                out_cli = optarg;
                 break;
 
             case 'f': {
@@ -91,11 +84,9 @@ int main(int argc, char **argv) {
     flash::config::SkytrackConfigFromFile cfg;
     const bool cfg_ok = cfg.LoadFile(config_path);
 
-    if (!cfg_ok && !out_cli) {
+    if (!cfg_ok) {
         std::fprintf(stderr, "ERROR: cannot load config: %s\n", config_path.c_str());
         return 1;
-    } else if (!cfg_ok && out_cli) {
-        std::fprintf(stderr, "WARN: cannot load config: %s (continuing due to -o)\n", config_path.c_str());
     } else {
         if (cfg.fsync_interval_bytes.has_value()) {
             opt.fsync_interval_bytes = *cfg.fsync_interval_bytes;
@@ -105,12 +96,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    std::string out;
-    if (out_cli) {
-        out = out_cli;
-    } else {
-        out = cfg.rootfs_part_b;
-    }
+    std::string out = cfg.rootfs_part_b;
 
     flash::FileOrStdinReader reader;
     if (auto r = flash::FileOrStdinReader::Open(in, reader); !r.ok) {
