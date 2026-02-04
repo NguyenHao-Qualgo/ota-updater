@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(FLASH_TOOL_USE_SUBMODULES "Use bundled third_party submodules" OFF)
 option(FLASH_TOOL_BUILD_TESTS "Build unit tests" OFF)
 
+find_package(ZLIB REQUIRED)
+find_package(LibArchive REQUIRED)
+
 if (FLASH_TOOL_USE_SUBMODULES)
   add_subdirectory(third_party/nlohmann_json EXCLUDE_FROM_ALL)
 else()
@@ -20,10 +23,14 @@ add_library(flash_core
   src/flasher.cpp
   src/signals.cpp
   src/config_parser.cpp
+  src/manifest.cpp
+  src/gzip_reader.cpp
+  src/update_module.cpp
+  src/archive_extractor.cpp
 )
 
 target_include_directories(flash_core PUBLIC include)
-target_link_libraries(flash_core PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(flash_core PUBLIC nlohmann_json::nlohmann_json ZLIB::ZLIB LibArchive::LibArchive)
 add_executable(flash_tool src/main.cpp)
 target_link_libraries(flash_tool PRIVATE flash_core)
 

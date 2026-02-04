@@ -2,6 +2,10 @@ add_executable(flash_tool_tests
   test_file_reader.cpp
   test_partition_writer.cpp
   test_fd.cpp
+  test_manifest.cpp
+  test_gzip_reader.cpp
+  test_update_module.cpp
+  test_archive_extractor.cpp
 )
 
 target_link_libraries(flash_tool_tests PRIVATE

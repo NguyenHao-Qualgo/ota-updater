@@ -1,0 +1,36 @@
+{
+  "version": "1.0.1",
+  "hw_compatibility": "jetson-orin-nano-devkit-nvme",
+  "components": [
+    {
+      "name": "rootfs",
+      "type": "archive",
+      "filename": "core-image-full-cmdline.tar.gz",
+      "install_to": "inactive_app_partition",
+      "sha256": "a36a...317"
+    },
+    {
+      "name": "kernel",
+      "type": "raw",
+      "filename": "tegra-minimal-initramfs.cboot",
+      "install_to": "inactive_kernel_partition",
+      "sha256": "..."
+    },
+    {
+      "name": "bootloader",
+      "type": "file",
+      "filename": "tegra-bl.cap",
+      "path": "/boot/efi/EFI/UpdateCapsule/TEGRA_BL.Cap",
+      "sha256": "...",
+      "version": "36.4.4"
+    },
+    {
+      "name": "wifi-config",
+      "type": "file",
+      "filename": "wpa_supplicant.conf",
+      "path": "/etc/wpa_supplicant/wpa_supplicant.conf",
+      "permissions": "0600",
+      "sha256": "..."
+    }
+  ]
+}
