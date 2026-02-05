@@ -11,7 +11,6 @@
 #include <sys/mount.h>
 #include <unistd.h>
 #include <vector>
-#include <sys/mount.h>
 
 namespace fs = std::filesystem;
 
@@ -19,8 +18,16 @@ namespace flash {
 
 namespace {
 
-struct ArchiveReadDeleter { void operator()(archive* a) const { if (a) archive_read_free(a); } };
-struct ArchiveWriteDeleter { void operator()(archive* a) const { if (a) archive_write_free(a); } };
+struct ArchiveReadDeleter {
+    void operator()(archive* a) const {
+        if (a) archive_read_free(a);
+    }
+};
+struct ArchiveWriteDeleter {
+    void operator()(archive* a) const {
+        if (a) archive_write_free(a);
+    }
+};
 
 class MountGuard {
 public:
@@ -42,7 +49,6 @@ public:
     ~MountGuard() { Cleanup(); }
 
     const std::string& Dir() const { return dir_; }
-
     void Release() { mounted_ = false; }
 
 private:
@@ -77,6 +83,35 @@ static bool IsSafeRelativePath(const std::string& p) {
     return true;
 }
 
+// Normalize tar path to a clean relative form:
+// - strip leading "./"
+// - strip leading "/" (avoid absolute)
+// - collapse duplicate slashes
+static std::string NormalizeTarPath(std::string s) {
+    while (s.rfind("./", 0) == 0) s.erase(0, 2);
+    while (!s.empty() && s.front() == '/') s.erase(0, 1);
+
+    std::string out;
+    out.reserve(s.size());
+    bool prev_slash = false;
+    for (char c : s) {
+        const bool slash = (c == '/');
+        if (slash && prev_slash) continue;
+        out.push_back(c);
+        prev_slash = slash;
+    }
+    return out;
+}
+
+static std::string JoinPath(const std::string& base, const std::string& rel) {
+    if (base.empty()) return rel;
+    if (rel.empty()) return base;
+    std::string full = base;
+    if (full.back() != '/') full.push_back('/');
+    full += rel;
+    return full;
+}
+
 struct ReaderCtx {
     IReader* r = nullptr;
     std::vector<std::uint8_t> buf;
@@ -96,6 +131,11 @@ static int CloseCb(struct archive*, void* client_data) {
     return ARCHIVE_OK;
 }
 
+static std::string ArchiveErr(archive* a) {
+    const char* s = a ? archive_error_string(a) : nullptr;
+    return s ? std::string(s) : std::string("unknown");
+}
+
 } // namespace
 
 ArchiveInstaller::ArchiveInstaller() : opt_() {
@@ -111,7 +151,6 @@ Result ArchiveInstaller::InstallTarStreamToTarget(IReader& tar_stream, std::stri
 
     // Case 1: /dev/... -> mount to temp dir then extract
     if (IsDevPath(install_to)) {
-        // Create mount dir like /mnt/ota-XXXXXX
         fs::path base = opt_.mount_base_dir.empty() ? "/mnt" : opt_.mount_base_dir;
         std::error_code ec;
         fs::create_directories(base, ec);
@@ -132,13 +171,17 @@ Result ArchiveInstaller::InstallTarStreamToTarget(IReader& tar_stream, std::stri
                 (int)install_to.size(), install_to.data(),
                 mount_dir.c_str());
 
-        if (::mount(std::string(install_to).c_str(), mount_dir.c_str(),
-                    opt_.fs_type.c_str(), opt_.mount_flags, nullptr) != 0) {
+        if (::mount(std::string(install_to).c_str(),
+                    mount_dir.c_str(),
+                    opt_.fs_type.c_str(),
+                    opt_.mount_flags,
+                    nullptr) != 0) {
             const int err = errno;
             return Result::Fail(err, "mount failed: " + std::string(std::strerror(err)));
         }
 
         MountGuard mg(mount_dir, true);
+
         auto r = ExtractTarStreamToDir(tar_stream, mg.Dir(), tag);
         if (!r.is_ok()) return r;
 
@@ -174,26 +217,34 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
     std::unique_ptr<archive, ArchiveReadDeleter> ar(archive_read_new());
     if (!ar) return Result::Fail(-1, "archive_read_new failed");
 
-    archive_read_support_format_tar(ar.get());
+    archive_read_support_filter_all(ar.get());
 
     auto* ctx = new ReaderCtx(tar_stream);
-    if (archive_read_open2(ar.get(), ctx, /*open*/nullptr, ReadCb, /*skip*/nullptr, CloseCb) != ARCHIVE_OK) {
-        const std::string em = archive_error_string(ar.get()) ? archive_error_string(ar.get()) : "unknown";
-        return Result::Fail(-1, "archive_read_open2: " + em);
+    if (archive_read_open2(ar.get(), ctx, /*open*/ nullptr, ReadCb, /*skip*/ nullptr, CloseCb) != ARCHIVE_OK) {
+        return Result::Fail(-1, "archive_read_open2: " + ArchiveErr(ar.get()));
     }
 
     std::unique_ptr<archive, ArchiveWriteDeleter> aw(archive_write_disk_new());
     if (!aw) return Result::Fail(-1, "archive_write_disk_new failed");
 
-    int flags = ARCHIVE_EXTRACT_SECURE_SYMLINKS | ARCHIVE_EXTRACT_SECURE_NODOTDOT | ARCHIVE_EXTRACT_UNLINK;
+    int flags = 0;
+    flags |= ARCHIVE_EXTRACT_UNLINK;
     flags |= ARCHIVE_EXTRACT_PERM;
     flags |= ARCHIVE_EXTRACT_TIME;
+
+    // Security / safety
+    flags |= ARCHIVE_EXTRACT_SECURE_NODOTDOT;
+    flags |= ARCHIVE_EXTRACT_SECURE_SYMLINKS;
+#if defined(ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS)
+    flags |= ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS;
+#endif
 
     archive_write_disk_set_options(aw.get(), flags);
     archive_write_disk_set_standard_lookup(aw.get());
 
     std::uint64_t extracted = 0;
-    std::uint64_t next_progress = opt_.progress_interval_bytes ? opt_.progress_interval_bytes : (4ULL * 1024 * 1024);
+    std::uint64_t next_progress =
+        (opt_.progress_interval_bytes ? opt_.progress_interval_bytes : (4ULL * 1024 * 1024));
 
     archive_entry* entry = nullptr;
 
@@ -201,28 +252,42 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
         const int r = archive_read_next_header(ar.get(), &entry);
         if (r == ARCHIVE_EOF) break;
         if (r != ARCHIVE_OK) {
-            const std::string em = archive_error_string(ar.get()) ? archive_error_string(ar.get()) : "unknown";
-            return Result::Fail(-1, "archive_read_next_header: " + em);
+            return Result::Fail(-1, "archive_read_next_header: " + ArchiveErr(ar.get()));
         }
 
+        // ---- rewrite pathname into dst_dir ----
         const char* p0 = archive_entry_pathname(entry);
-        std::string rel = p0 ? std::string(p0) : std::string();
+        std::string rel = NormalizeTarPath(p0 ? std::string(p0) : std::string());
 
+        if (rel.empty() || rel == ".") {
+            // Ensure we consume any payload (usually none) then continue.
+            (void)archive_read_data_skip(ar.get());
+            continue;
+        }
         if (opt_.safe_paths_only && !IsSafeRelativePath(rel)) {
             return Result::Fail(-1, "Unsafe path in archive: " + rel);
         }
 
-        std::string full = dst_dir;
-        if (!full.empty() && full.back() != '/') full.push_back('/');
-        full += rel;
-
+        std::string full = JoinPath(dst_dir, rel);
         archive_entry_set_pathname(entry, full.c_str());
+
+        // Hardlink target rewrite: also guard empty / "." just in case
+        if (const char* hl0 = archive_entry_hardlink(entry); hl0 && *hl0) {
+            std::string rel_hl = NormalizeTarPath(std::string(hl0));
+            if (!rel_hl.empty() && rel_hl != ".") {
+                if (opt_.safe_paths_only && !IsSafeRelativePath(rel_hl)) {
+                    return Result::Fail(-1, "Unsafe hardlink target in archive: " + rel_hl);
+                }
+                std::string full_hl = JoinPath(dst_dir, rel_hl);
+                archive_entry_set_hardlink(entry, full_hl.c_str());
+            }
+        }
+
         LogDebug("[%.*s] entry: %s", (int)tag.size(), tag.data(), full.c_str());
 
         const int wh = archive_write_header(aw.get(), entry);
         if (wh != ARCHIVE_OK) {
-            const std::string em = archive_error_string(aw.get()) ? archive_error_string(aw.get()) : "unknown";
-            return Result::Fail(-1, "archive_write_header: " + em);
+            return Result::Fail(-1, "archive_write_header: " + ArchiveErr(aw.get()));
         }
 
         // copy content
@@ -234,28 +299,26 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
             const int rr = archive_read_data_block(ar.get(), &buff, &size, &offset);
             if (rr == ARCHIVE_EOF) break;
             if (rr != ARCHIVE_OK) {
-                const std::string em = archive_error_string(ar.get()) ? archive_error_string(ar.get()) : "unknown";
-                return Result::Fail(-1, "archive_read_data_block: " + em);
+                return Result::Fail(-1, "archive_read_data_block: " + ArchiveErr(ar.get()));
             }
 
             const int ww = archive_write_data_block(aw.get(), buff, size, offset);
             if (ww != ARCHIVE_OK) {
-                const std::string em = archive_error_string(aw.get()) ? archive_error_string(aw.get()) : "unknown";
-                return Result::Fail(-1, "archive_write_data_block: " + em);
+                return Result::Fail(-1, "archive_write_data_block: " + ArchiveErr(aw.get()));
             }
 
             extracted += static_cast<std::uint64_t>(size);
             if (opt_.progress && opt_.progress_interval_bytes > 0 && extracted >= next_progress) {
                 LogInfo("[%.*s] extract progress: %llu bytes",
-                        (int)tag.size(), tag.data(), (unsigned long long)extracted);
+                        (int)tag.size(), tag.data(),
+                        (unsigned long long)extracted);
                 next_progress = extracted + opt_.progress_interval_bytes;
             }
         }
 
         const int wf = archive_write_finish_entry(aw.get());
         if (wf != ARCHIVE_OK) {
-            const std::string em = archive_error_string(aw.get()) ? archive_error_string(aw.get()) : "unknown";
-            return Result::Fail(-1, "archive_write_finish_entry: " + em);
+            return Result::Fail(-1, "archive_write_finish_entry: " + ArchiveErr(aw.get()));
         }
     }
 
