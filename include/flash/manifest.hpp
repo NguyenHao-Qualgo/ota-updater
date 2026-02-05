@@ -17,6 +17,7 @@ struct Component {
     std::string install_to;   
     std::string path;         
     std::string permissions = "0644";
+    bool create_destination = false;
 };
 
 struct Manifest {

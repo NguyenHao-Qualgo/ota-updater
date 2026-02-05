@@ -1,4 +1,6 @@
 #include "flash/manifest.hpp"
+
+#include <charconv>
 #include <nlohmann/json.hpp>
 #include <sstream>
 
@@ -35,6 +37,7 @@ std::expected<Manifest, std::string> ManifestHandler::Parse(const std::string& j
                 c.install_to = item.value("install_to", "");
                 c.path = item.value("path", "");
                 c.permissions = item.value("permissions", "0644");
+                c.create_destination = item.value("create-destination", false);
                 m.components.push_back(c);
             }
         } else if (j.contains("components") && !j["components"].is_array()) {

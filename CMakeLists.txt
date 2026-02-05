@@ -26,7 +26,10 @@ add_library(flash_core
   src/manifest.cpp
   src/gzip_reader.cpp
   src/update_module.cpp
-  src/archive_extractor.cpp
+  src/ota_bundle_reader.cpp
+  src/logger.cpp
+  src/ota_installer.cpp
+  src/archive_installer.cpp
 )
 
 target_include_directories(flash_core PUBLIC include)
