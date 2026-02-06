@@ -1,5 +1,6 @@
 #include "flash/archive_installer.hpp"
 #include "flash/logger.hpp"
+#include "flash/signals.hpp"
 
 #include <archive.h>
 #include <archive_entry.h>
@@ -62,6 +63,35 @@ private:
     bool mounted_ = false;
 };
 
+#include <fcntl.h>
+#include <unistd.h>
+
+class ChdirGuard {
+public:
+    explicit ChdirGuard(const std::string& new_dir) {
+        old_fd_ = ::open(".", O_RDONLY | O_DIRECTORY);
+        if (old_fd_ < 0) return;
+
+        if (::chdir(new_dir.c_str()) != 0) {
+            ::close(old_fd_);
+            old_fd_ = -1;
+        }
+    }
+
+    ~ChdirGuard() {
+        if (old_fd_ >= 0) {
+            (void)::fchdir(old_fd_);
+            ::close(old_fd_);
+        }
+    }
+
+    bool ok() const { return old_fd_ >= 0; }
+
+private:
+    int old_fd_ = -1;
+};
+
+
 static bool IsDevPath(std::string_view s) {
     return s.rfind("/dev/", 0) == 0;
 }
@@ -119,6 +149,10 @@ struct ReaderCtx {
 };
 
 static la_ssize_t ReadCb(struct archive*, void* client_data, const void** out_buf) {
+    if (flash::g_cancel.load(std::memory_order_relaxed)) {
+        errno = EINTR;
+        return -1;
+    }
     auto* ctx = static_cast<ReaderCtx*>(client_data);
     const ssize_t n = ctx->r->Read(std::span<std::uint8_t>(ctx->buf.data(), ctx->buf.size()));
     if (n < 0) return -1;
@@ -149,7 +183,6 @@ ArchiveInstaller::ArchiveInstaller(Options opt) : opt_(std::move(opt)) {
 Result ArchiveInstaller::InstallTarStreamToTarget(IReader& tar_stream, std::string_view install_to, std::string_view tag) {
     if (install_to.empty()) return Result::Fail(-1, "install_to is empty");
 
-    // Case 1: /dev/... -> mount to temp dir then extract
     if (IsDevPath(install_to)) {
         fs::path base = opt_.mount_base_dir.empty() ? "/mnt" : opt_.mount_base_dir;
         std::error_code ec;
@@ -218,9 +251,11 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
     if (!ar) return Result::Fail(-1, "archive_read_new failed");
 
     archive_read_support_filter_all(ar.get());
+    archive_read_support_format_all(ar.get());
 
     auto* ctx = new ReaderCtx(tar_stream);
-    if (archive_read_open2(ar.get(), ctx, /*open*/ nullptr, ReadCb, /*skip*/ nullptr, CloseCb) != ARCHIVE_OK) {
+    if (archive_read_open2(ar.get(), ctx, nullptr, ReadCb, nullptr, CloseCb) != ARCHIVE_OK) {
+        delete ctx;
         return Result::Fail(-1, "archive_read_open2: " + ArchiveErr(ar.get()));
     }
 
@@ -232,15 +267,20 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
     flags |= ARCHIVE_EXTRACT_PERM;
     flags |= ARCHIVE_EXTRACT_TIME;
 
-    // Security / safety
     flags |= ARCHIVE_EXTRACT_SECURE_NODOTDOT;
     flags |= ARCHIVE_EXTRACT_SECURE_SYMLINKS;
 #if defined(ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS)
-    flags |= ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS;
+    flags |= ARCHIVE_EXTRACT_SECURE_NOABSOLUTEPATHS;  // now OK because we keep relative paths
 #endif
 
     archive_write_disk_set_options(aw.get(), flags);
     archive_write_disk_set_standard_lookup(aw.get());
+
+    // IMPORTANT: extract relative paths into dst_dir
+    ChdirGuard cd(dst_dir);
+    if (!cd.ok()) {
+        return Result::Fail(errno, "chdir(dst_dir) failed: " + std::string(std::strerror(errno)));
+    }
 
     std::uint64_t extracted = 0;
     std::uint64_t next_progress =
@@ -251,16 +291,12 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
     while (true) {
         const int r = archive_read_next_header(ar.get(), &entry);
         if (r == ARCHIVE_EOF) break;
-        if (r != ARCHIVE_OK) {
-            return Result::Fail(-1, "archive_read_next_header: " + ArchiveErr(ar.get()));
-        }
+        if (r != ARCHIVE_OK) return Result::Fail(-1, "archive_read_next_header: " + ArchiveErr(ar.get()));
 
-        // ---- rewrite pathname into dst_dir ----
         const char* p0 = archive_entry_pathname(entry);
         std::string rel = NormalizeTarPath(p0 ? std::string(p0) : std::string());
 
         if (rel.empty() || rel == ".") {
-            // Ensure we consume any payload (usually none) then continue.
             (void)archive_read_data_skip(ar.get());
             continue;
         }
@@ -268,29 +304,25 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
             return Result::Fail(-1, "Unsafe path in archive: " + rel);
         }
 
-        std::string full = JoinPath(dst_dir, rel);
-        archive_entry_set_pathname(entry, full.c_str());
+        // Keep RELATIVE path (critical fix)
+        archive_entry_set_pathname(entry, rel.c_str());
 
-        // Hardlink target rewrite: also guard empty / "." just in case
+        // Hardlink target should also be relative
         if (const char* hl0 = archive_entry_hardlink(entry); hl0 && *hl0) {
             std::string rel_hl = NormalizeTarPath(std::string(hl0));
             if (!rel_hl.empty() && rel_hl != ".") {
                 if (opt_.safe_paths_only && !IsSafeRelativePath(rel_hl)) {
                     return Result::Fail(-1, "Unsafe hardlink target in archive: " + rel_hl);
                 }
-                std::string full_hl = JoinPath(dst_dir, rel_hl);
-                archive_entry_set_hardlink(entry, full_hl.c_str());
+                archive_entry_set_hardlink(entry, rel_hl.c_str());
             }
         }
 
-        LogDebug("[%.*s] entry: %s", (int)tag.size(), tag.data(), full.c_str());
+        LogDebug("[%.*s] entry: %s/%s", (int)tag.size(), tag.data(), dst_dir.c_str(), rel.c_str());
 
         const int wh = archive_write_header(aw.get(), entry);
-        if (wh != ARCHIVE_OK) {
-            return Result::Fail(-1, "archive_write_header: " + ArchiveErr(aw.get()));
-        }
+        if (wh != ARCHIVE_OK) return Result::Fail(-1, "archive_write_header: " + ArchiveErr(aw.get()));
 
-        // copy content
         const void* buff = nullptr;
         size_t size = 0;
         la_int64_t offset = 0;
@@ -298,31 +330,25 @@ Result ArchiveInstaller::ExtractTarStreamToDir(IReader& tar_stream, const std::s
         while (true) {
             const int rr = archive_read_data_block(ar.get(), &buff, &size, &offset);
             if (rr == ARCHIVE_EOF) break;
-            if (rr != ARCHIVE_OK) {
-                return Result::Fail(-1, "archive_read_data_block: " + ArchiveErr(ar.get()));
-            }
+            if (rr != ARCHIVE_OK) return Result::Fail(-1, "archive_read_data_block: " + ArchiveErr(ar.get()));
 
             const int ww = archive_write_data_block(aw.get(), buff, size, offset);
-            if (ww != ARCHIVE_OK) {
-                return Result::Fail(-1, "archive_write_data_block: " + ArchiveErr(aw.get()));
-            }
+            if (ww != ARCHIVE_OK) return Result::Fail(-1, "archive_write_data_block: " + ArchiveErr(aw.get()));
 
-            extracted += static_cast<std::uint64_t>(size);
+            extracted += (std::uint64_t)size;
             if (opt_.progress && opt_.progress_interval_bytes > 0 && extracted >= next_progress) {
                 LogInfo("[%.*s] extract progress: %llu bytes",
-                        (int)tag.size(), tag.data(),
-                        (unsigned long long)extracted);
+                        (int)tag.size(), tag.data(), (unsigned long long)extracted);
                 next_progress = extracted + opt_.progress_interval_bytes;
             }
         }
 
         const int wf = archive_write_finish_entry(aw.get());
-        if (wf != ARCHIVE_OK) {
-            return Result::Fail(-1, "archive_write_finish_entry: " + ArchiveErr(aw.get()));
-        }
+        if (wf != ARCHIVE_OK) return Result::Fail(-1, "archive_write_finish_entry: " + ArchiveErr(aw.get()));
     }
 
     return Result::Ok();
 }
+
 
 } // namespace flash

@@ -20,6 +20,10 @@ static bool EndsWithGz(const std::string& s) {
     return s.size() >= 3 && s.compare(s.size() - 3, 3, ".gz") == 0;
 }
 
+static bool IsDevPath(std::string_view s) {
+    return s.rfind("/dev/", 0) == 0;
+}
+
 // Counts bytes read from the *bundle entry stream* (compressed bytes if the entry is .gz).
 class CountingReader final : public IReader {
 public:
@@ -48,19 +52,18 @@ static void EmitProgress(const UpdateModule::Options& opt,
                          bool final) {
     if (!opt.progress) return;
 
-    // Component %
     if (opt.component_total_bytes > 0) {
-        const int pct = static_cast<int>((in_done * 100ULL) / opt.component_total_bytes);
+        const int comp_pct = static_cast<int>((in_done * 100ULL) / opt.component_total_bytes);
 
         if (opt.overall_total_bytes > 0) {
             const std::uint64_t overall_done = opt.overall_done_base_bytes + in_done;
-            const int opct = static_cast<int>((overall_done * 100ULL) / opt.overall_total_bytes);
+            const int ota_pct = static_cast<int>((overall_done * 100ULL) / opt.overall_total_bytes);
 
             LogInfo("[%s] %s OTA:%d%% COMP:%d%% (in %llu/%llu, out %llu)",
                     tag,
                     final ? "done" : "progress",
-                    opct,
-                    pct,
+                    ota_pct,
+                    comp_pct,
                     (unsigned long long)in_done,
                     (unsigned long long)opt.component_total_bytes,
                     (unsigned long long)out_written);
@@ -68,13 +71,12 @@ static void EmitProgress(const UpdateModule::Options& opt,
             LogInfo("[%s] %s %d%% (in %llu/%llu, out %llu)",
                     tag,
                     final ? "done" : "progress",
-                    pct,
+                    comp_pct,
                     (unsigned long long)in_done,
                     (unsigned long long)opt.component_total_bytes,
                     (unsigned long long)out_written);
         }
     } else {
-        // Unknown total => show bytes
         LogInfo("[%s] %s (in %llu bytes, out %llu bytes)",
                 tag,
                 final ? "done" : "progress",
@@ -93,12 +95,10 @@ Result UpdateModule::Execute(const Component& comp, std::unique_ptr<IReader> sou
     LogInfo("UpdateModule: name=%s type=%s file=%s",
             comp.name.c_str(), comp.type.c_str(), comp.filename.c_str());
 
-    // Count bundle-entry bytes read (compressed if .gz).
     std::uint64_t in_read = 0;
     std::unique_ptr<IReader> effective_reader =
         std::make_unique<CountingReader>(std::move(source), &in_read);
 
-    // Wrap gzip if needed (gzip reads from CountingReader -> in_read tracks compressed bytes)
     if (EndsWithGz(comp.filename)) {
         try {
             LogDebug("Wrapping GzipReader for %s", comp.filename.c_str());
@@ -119,7 +119,8 @@ Result UpdateModule::Execute(const Component& comp, std::unique_ptr<IReader> sou
     return Result::Fail(-1, "Unsupported component type: " + comp.type);
 }
 
-Result UpdateModule::InstallRaw(const Component& comp, IReader& reader, const Options& opt, const char* tag, const std::uint64_t* in_read) {
+Result UpdateModule::InstallRaw(const Component& comp, IReader& reader, const Options& opt,
+                                const char* tag, const std::uint64_t* in_read) {
     if (comp.install_to.empty()) {
         return Result::Fail(-1, "install_to empty for raw component: " + comp.name);
     }
@@ -131,19 +132,34 @@ Result UpdateModule::InstallRaw(const Component& comp, IReader& reader, const Op
     return InternalPipe(reader, writer, opt, tag, in_read);
 }
 
-Result UpdateModule::InstallArchive(const Component& comp, IReader& reader, const Options& opt, const char* tag, const std::uint64_t* /*in_read*/) {
-    // ArchiveInstaller currently logs its own byte-progress; overall % can still be emitted
-    // by UpdateModule if you add callbacks there later. For now, keep it simple.
+Result UpdateModule::InstallArchive(const Component& comp, IReader& reader, const Options& opt,
+                                    const char* /*tag*/, const std::uint64_t* /*in_read*/) {
+    // Decide destination:
+    // - prefer install_to if it is /dev/...
+    // - else if manifest provides "path" => extract to that folder
+    // - else use install_to as folder
+    std::string target;
+    if (!comp.install_to.empty() && IsDevPath(comp.install_to)) {
+        target = comp.install_to; // device node
+    } else if (!comp.path.empty()) {
+        target = comp.path;       // folder path like /boot/efi
+    } else if (!comp.install_to.empty()) {
+        target = comp.install_to; // folder path
+    } else {
+        return Result::Fail(-1, "archive component needs install_to(/dev/...) or path(folder): " + comp.name);
+    }
+
     ArchiveInstaller::Options aopt;
     aopt.progress = opt.progress;
     aopt.progress_interval_bytes = opt.progress_interval_bytes;
-
+    // keep safe paths enabled by default
     ArchiveInstaller installer(aopt);
-    auto r = installer.InstallTarStreamToTarget(reader, comp.install_to, comp.name);
-    return r;
+
+    return installer.InstallTarStreamToTarget(reader, target, comp.name);
 }
 
-Result UpdateModule::InstallAtomicFile(const Component& comp, IReader& reader, const Options& opt, const char* tag, const std::uint64_t* in_read) {
+Result UpdateModule::InstallAtomicFile(const Component& comp, IReader& reader, const Options& opt,
+                                       const char* tag, const std::uint64_t* in_read) {
     if (comp.path.empty()) {
         return Result::Fail(-1, "File path is empty for component: " + comp.name);
     }
@@ -196,15 +212,15 @@ Result UpdateModule::InstallAtomicFile(const Component& comp, IReader& reader, c
     return Result::Ok();
 }
 
-Result UpdateModule::InternalPipe(IReader& r, IWriter& w, const Options& opt, const char* tag, const std::uint64_t* in_read) {
-    std::vector<std::uint8_t> buffer(1024 * 1024); // 1MB
+Result UpdateModule::InternalPipe(IReader& r, IWriter& w, const Options& opt,
+                                  const char* tag, const std::uint64_t* in_read) {
+    std::vector<std::uint8_t> buffer(1024 * 1024);
 
     std::uint64_t written = 0;
     std::uint64_t next_progress = opt.progress_interval_bytes;
     std::uint64_t next_fsync = opt.fsync_interval_bytes;
 
-    // initial progress line
-    EmitProgress(opt, tag, in_read ? *in_read : 0, written, /*final=*/false);
+    EmitProgress(opt, tag, in_read ? *in_read : 0, written, false);
 
     while (true) {
         const ssize_t n = r.Read(std::span<std::uint8_t>(buffer.data(), buffer.size()));
@@ -219,7 +235,7 @@ Result UpdateModule::InternalPipe(IReader& r, IWriter& w, const Options& opt, co
         const std::uint64_t in_done = in_read ? *in_read : written;
 
         if (opt.progress && opt.progress_interval_bytes > 0 && in_done >= next_progress) {
-            EmitProgress(opt, tag, in_done, written, /*final=*/false);
+            EmitProgress(opt, tag, in_done, written, false);
             next_progress = in_done + opt.progress_interval_bytes;
         }
 
@@ -234,7 +250,7 @@ Result UpdateModule::InternalPipe(IReader& r, IWriter& w, const Options& opt, co
     auto fr = w.FsyncNow();
     if (!fr.is_ok()) return fr;
 
-    EmitProgress(opt, tag, in_read ? *in_read : written, written, /*final=*/true);
+    EmitProgress(opt, tag, in_read ? *in_read : written, written, true);
     return Result::Ok();
 }
 
